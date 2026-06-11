@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Illustration Practice Tool - Phase 1</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  html, body, #root { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", "Helvetica Neue", sans-serif; }
+  .touch-none { touch-action: none; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+    "three": "https://esm.sh/three@0.166.0",
+    "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.17.10?external=react,react-dom,three",
+    "zustand": "https://esm.sh/zustand@4.5.5?external=react"
+  }
+}
+</script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="module">
+import React, { useEffect, useRef, useCallback } from "react";
+import { createRoot } from "react-dom/client";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { create } from "zustand";
+
+const e = React.createElement;
+
+// ============================================================
+// lib/coordinates
+// ============================================================
+
+const PHI_MIN = 0.1;
+const PHI_MAX = 179.9;
+const RADIUS_MIN = 2;
+const RADIUS_MAX = 50;
+
+function sphericalToCartesian(sph, target) {
+  const phiRad = (sph.phi * Math.PI) / 180;
+  const thetaRad = (sph.theta * Math.PI) / 180;
+  return {
+    x: target.x + sph.radius * Math.sin(phiRad) * Math.cos(thetaRad),
+    y: target.y + sph.radius * Math.cos(phiRad),
+    z: target.z + sph.radius * Math.sin(phiRad) * Math.sin(thetaRad),
+  };
+}
+
+function normalizeTheta(theta) {
+  return ((theta % 360) + 360) % 360;
+}
+
+function clampPhi(phi) {
+  return Math.max(PHI_MIN, Math.min(PHI_MAX, phi));
+}
+
+function clampRadius(radius) {
+  return Math.max(RADIUS_MIN, Math.min(RADIUS_MAX, radius));
+}
+
+// ============================================================
+// lib/character: STANDARD_MALE_75
+// ============================================================
+
+const C = {
+  shoulder_width_ratio: 2.5,
+  waist_width_ratio: 1.7,
+  hip_width_ratio: 2.0,
+};
+
+// ============================================================
+// lib/bodyParts
+// ============================================================
+
+const SINGLE_PARTS = ["head", "torso", "arm_left", "arm_right", "leg_left", "leg_right"];
+const COMPOSITE_PARTS = ["upper_body", "lower_body", "full_body"];
+
+const PART_LABELS = {
+  head: "頭",
+  torso: "胴",
+  arm_left: "左腕",
+  arm_right: "右腕",
+  leg_left: "左脚",
+  leg_right: "右脚",
+  upper_body: "上半身",
+  lower_body: "下半身",
+  full_body: "全身",
+};
+
+function isPartSelected(selected, part) {
+  if (selected === "full_body") return true;
+  if (selected === part) return true;
+  if (selected === "upper_body") {
+    return ["head", "torso", "arm_left", "arm_right"].includes(part);
+  }
+  if (selected === "lower_body") {
+    return ["leg_left", "leg_right"].includes(part);
+  }
+  return false;
+}
+
+// ============================================================
+// lib/cameraPresets
+// ============================================================
+
+const CAMERA_PRESETS = [
+  { name: "front", label: "正面", spherical: { theta: 0, phi: 90, radius: 12 }, focalLengthMm: 50 },
+  { name: "three_quarter_front", label: "斜め前", spherical: { theta: 45, phi: 90, radius: 12 }, focalLengthMm: 50 },
+  { name: "side_right", label: "右側面", spherical: { theta: 90, phi: 90, radius: 12 }, focalLengthMm: 50 },
+  { name: "back", label: "背面", spherical: { theta: 180, phi: 90, radius: 12 }, focalLengthMm: 50 },
+  { name: "side_left", label: "左側面", spherical: { theta: 270, phi: 90, radius: 12 }, focalLengthMm: 50 },
+  { name: "low_angle", label: "アオリ", spherical: { theta: 30, phi: 120, radius: 10 }, focalLengthMm: 35 },
+  { name: "high_angle", label: "フカン", spherical: { theta: 30, phi: 60, radius: 10 }, focalLengthMm: 35 },
+  { name: "top_down", label: "真俯瞰", spherical: { theta: 0, phi: 5, radius: 15 }, focalLengthMm: 50 },
+];
+
+// ============================================================
+// stores/cameraStore
+// ============================================================
+
+const INITIAL_CAMERA = {
+  spherical: { theta: 0, phi: 90, radius: 12 },
+  target: { x: 0, y: 3.5, z: 0 },
+  focalLengthMm: 50,
+  presetName: "front",
+};
+
+const useCameraStore = create((set) => ({
+  ...INITIAL_CAMERA,
+  setAngle: (theta, phi) =>
+    set((state) => ({
+      spherical: {
+        theta: normalizeTheta(theta),
+        phi: clampPhi(phi),
+        radius: state.spherical.radius,
+      },
+      presetName: null,
+    })),
+  setRadius: (radius) =>
+    set((state) => ({
+      spherical: { ...state.spherical, radius: clampRadius(radius) },
+      presetName: null,
+    })),
+  applyPreset: (preset) =>
+    set({
+      spherical: { ...preset.spherical },
+      focalLengthMm: preset.focalLengthMm,
+      presetName: preset.name,
+    }),
+  reset: () => set({ ...INITIAL_CAMERA }),
+}));
+
+// ============================================================
+// stores/poseStore
+// ============================================================
+
+const usePoseStore = create((set) => ({
+  selectedPart: "full_body",
+  setSelectedPart: (part) => set({ selectedPart: part }),
+}));
+
+// ============================================================
+// Mannequin
+// ============================================================
+
+const SELECTED_COLOR = "#ef4444";
+const DEFAULT_COLOR = "#94a3b8";
+const EDGE_COLOR = "#475569";
+
+function Limb({ from, to, radius, color }) {
+  const dx = to[0] - from[0];
+  const dy = to[1] - from[1];
+  const dz = to[2] - from[2];
+  const length = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  const midX = (from[0] + to[0]) / 2;
+  const midY = (from[1] + to[1]) / 2;
+  const midZ = (from[2] + to[2]) / 2;
+
+  const dirX = dx / length;
+  const dirY = dy / length;
+  const dirZ = dz / length;
+
+  const axisX = 1 * dirZ - 0 * dirY;
+  const axisY = 0 * dirX - 0 * dirZ;
+  const axisZ = 0 * dirY - 1 * dirX;
+  const axisLen = Math.sqrt(axisX * axisX + axisY * axisY + axisZ * axisZ);
+
+  const dot = dirY;
+  const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
+
+  let nAxisX, nAxisY, nAxisZ;
+  if (axisLen < 0.0001) {
+    nAxisX = dot > 0 ? 0 : 1;
+    nAxisY = 0;
+    nAxisZ = 0;
+  } else {
+    nAxisX = axisX / axisLen;
+    nAxisY = axisY / axisLen;
+    nAxisZ = axisZ / axisLen;
+  }
+
+  return e("mesh", {
+    position: [midX, midY, midZ],
+    quaternion: [
+      nAxisX * Math.sin(angle / 2),
+      nAxisY * Math.sin(angle / 2),
+      nAxisZ * Math.sin(angle / 2),
+      Math.cos(angle / 2),
+    ],
+  },
+    e("cylinderGeometry", { args: [radius, radius, length, 12] }),
+    e("meshStandardMaterial", { color })
+  );
+}
+
+function Mannequin() {
+  const selectedPart = usePoseStore((s) => s.selectedPart);
+  const colorFor = (part) => (isPartSelected(selectedPart, part) ? SELECTED_COLOR : DEFAULT_COLOR);
+  const sw = (C.shoulder_width_ratio / 2) * 0.7;
+
+  return e("group", null,
+    e("ambientLight", { intensity: 0.7 }),
+    e("directionalLight", { position: [5, 10, 5], intensity: 0.6 }),
+    e("directionalLight", { position: [-5, 5, -5], intensity: 0.3 }),
+    
+    e("mesh", { rotation: [-Math.PI / 2, 0, 0], position: [0, 0, 0] },
+      e("planeGeometry", { args: [20, 20] }),
+      e("meshStandardMaterial", { color: "#f1f5f9" })
+    ),
+    // 頭
+    e("mesh", { position: [0, 7, 0] },
+      e("sphereGeometry", { args: [0.5, 24, 24] }),
+      e("meshStandardMaterial", { color: colorFor("head") })
+    ),
+    // 首
+    e("mesh", { position: [0, 6.4, 0] },
+      e("cylinderGeometry", { args: [0.15, 0.15, 0.3, 12] }),
+      e("meshStandardMaterial", { color: EDGE_COLOR })
+    ),
+    // 胴体上部
+    e("mesh", { position: [0, 5.6, 0] },
+      e("boxGeometry", { args: [C.shoulder_width_ratio * 0.7, 1.2, 0.6] }),
+      e("meshStandardMaterial", { color: colorFor("torso") })
+    ),
+    // 胴体下部
+    e("mesh", { position: [0, 4.3, 0] },
+      e("boxGeometry", { args: [C.waist_width_ratio * 0.7, 1.2, 0.5] }),
+      e("meshStandardMaterial", { color: colorFor("torso") })
+    ),
+    // 腰
+    e("mesh", { position: [0, 3.6, 0] },
+      e("boxGeometry", { args: [C.hip_width_ratio * 0.7, 0.5, 0.55] }),
+      e("meshStandardMaterial", { color: colorFor("torso") })
+    ),
+    // 右腕
+    e(Limb, { from: [-sw, 5.8, 0], to: [-sw - 0.2, 4.4, 0], radius: 0.18, color: colorFor("arm_right") }),
+    e(Limb, { from: [-sw - 0.2, 4.4, 0], to: [-sw - 0.2, 3.2, 0], radius: 0.15, color: colorFor("arm_right") }),
+    e("mesh", { position: [-sw - 0.2, 3.0, 0] },
+      e("sphereGeometry", { args: [0.18, 12, 12] }),
+      e("meshStandardMaterial", { color: colorFor("arm_right") })
+    ),
+    // 左腕
+    e(Limb, { from: [sw, 5.8, 0], to: [sw + 0.2, 4.4, 0], radius: 0.18, color: colorFor("arm_left") }),
+    e(Limb, { from: [sw + 0.2, 4.4, 0], to: [sw + 0.2, 3.2, 0], radius: 0.15, color: colorFor("arm_left") }),
+    e("mesh", { position: [sw + 0.2, 3.0, 0] },
+      e("sphereGeometry", { args: [0.18, 12, 12] }),
+      e("meshStandardMaterial", { color: colorFor("arm_left") })
+    ),
+    // 右脚
+    e(Limb, { from: [-0.35, 3.3, 0], to: [-0.35, 1.7, 0], radius: 0.22, color: colorFor("leg_right") }),
+    e(Limb, { from: [-0.35, 1.7, 0], to: [-0.35, 0.15, 0], radius: 0.18, color: colorFor("leg_right") }),
+    e("mesh", { position: [-0.35, 0.08, 0.2] },
+      e("boxGeometry", { args: [0.3, 0.15, 0.5] }),
+      e("meshStandardMaterial", { color: colorFor("leg_right") })
+    ),
+    // 左脚
+    e(Limb, { from: [0.35, 3.3, 0], to: [0.35, 1.7, 0], radius: 0.22, color: colorFor("leg_left") }),
+    e(Limb, { from: [0.35, 1.7, 0], to: [0.35, 0.15, 0], radius: 0.18, color: colorFor("leg_left") }),
+    e("mesh", { position: [0.35, 0.08, 0.2] },
+      e("boxGeometry", { args: [0.3, 0.15, 0.5] }),
+      e("meshStandardMaterial", { color: colorFor("leg_left") })
+    )
+  );
+}
+
+// ============================================================
+// CameraController
+// ============================================================
+
+function CameraController() {
+  const spherical = useCameraStore((s) => s.spherical);
+  const target = useCameraStore((s) => s.target);
+  const focalLengthMm = useCameraStore((s) => s.focalLengthMm);
+  const { camera } = useThree();
+
+  useEffect(() => {
+    const fovDeg = (2 * Math.atan(24 / (2 * focalLengthMm)) * 180) / Math.PI;
+    if ("fov" in camera) {
+      camera.fov = fovDeg;
+      camera.updateProjectionMatrix();
+    }
+  }, [focalLengthMm, camera]);
+
+  useFrame(() => {
+    const pos = sphericalToCartesian(spherical, target);
+    camera.position.set(pos.x, pos.y, pos.z);
+    camera.lookAt(target.x, target.y, target.z);
+  });
+
+  return null;
+}
+
+// ============================================================
+// DragHandler
+// ============================================================
+
+const ROTATION_SPEED = 0.4;
+const ZOOM_SPEED = 0.02;
+
+function DragHandler({ children }) {
+  const setAngle = useCameraStore((s) => s.setAngle);
+  const setRadius = useCameraStore((s) => s.setRadius);
+  const dragRef = useRef(null);
+  const pinchRef = useRef(null);
+
+  const handlePointerDown = useCallback((ev) => {
+    if (ev.pointerType === "touch") {
+      // タッチの場合、ピンチ判定は touchstart で
+    }
+    const state = useCameraStore.getState();
+    dragRef.current = {
+      startX: ev.clientX,
+      startY: ev.clientY,
+      startTheta: state.spherical.theta,
+      startPhi: state.spherical.phi,
+    };
+    try { ev.target.setPointerCapture(ev.pointerId); } catch {}
+  }, []);
+
+  const handlePointerMove = useCallback((ev) => {
+    if (!dragRef.current) return;
+    const dx = ev.clientX - dragRef.current.startX;
+    const dy = ev.clientY - dragRef.current.startY;
+    setAngle(
+      dragRef.current.startTheta + dx * ROTATION_SPEED,
+      dragRef.current.startPhi + dy * ROTATION_SPEED
+    );
+  }, [setAngle]);
+
+  const handlePointerUp = useCallback((ev) => {
+    dragRef.current = null;
+    try { ev.target.releasePointerCapture(ev.pointerId); } catch {}
+  }, []);
+
+  const handleWheel = useCallback((ev) => {
+    const current = useCameraStore.getState().spherical.radius;
+    setRadius(current + ev.deltaY * ZOOM_SPEED);
+  }, [setRadius]);
+
+  const handleTouchStart = useCallback((ev) => {
+    if (ev.touches.length === 2) {
+      const dx = ev.touches[0].clientX - ev.touches[1].clientX;
+      const dy = ev.touches[0].clientY - ev.touches[1].clientY;
+      pinchRef.current = {
+        startDist: Math.sqrt(dx * dx + dy * dy),
+        startRadius: useCameraStore.getState().spherical.radius,
+      };
+      dragRef.current = null;
+    }
+  }, []);
+
+  const handleTouchMove = useCallback((ev) => {
+    if (ev.touches.length === 2 && pinchRef.current) {
+      const dx = ev.touches[0].clientX - ev.touches[1].clientX;
+      const dy = ev.touches[0].clientY - ev.touches[1].clientY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      setRadius(pinchRef.current.startRadius * (pinchRef.current.startDist / dist));
+    }
+  }, [setRadius]);
+
+  const handleTouchEnd = useCallback(() => {
+    pinchRef.current = null;
+  }, []);
+
+  return e("div", {
+    className: "absolute inset-0 touch-none",
+    onPointerDown: handlePointerDown,
+    onPointerMove: handlePointerMove,
+    onPointerUp: handlePointerUp,
+    onPointerCancel: handlePointerUp,
+    onWheel: handleWheel,
+    onTouchStart: handleTouchStart,
+    onTouchMove: handleTouchMove,
+    onTouchEnd: handleTouchEnd,
+  }, children);
+}
+
+// ============================================================
+// UI Components
+// ============================================================
+
+function CameraInfo() {
+  const spherical = useCameraStore((s) => s.spherical);
+  const focalLengthMm = useCameraStore((s) => s.focalLengthMm);
+  const presetName = useCameraStore((s) => s.presetName);
+
+  return e("div", {
+    className: "absolute top-3 left-3 bg-white/95 backdrop-blur rounded-lg p-3 text-xs shadow-lg pointer-events-none border border-slate-200"
+  },
+    e("div", { className: "font-semibold mb-1.5 text-slate-700" }, "Camera"),
+    e("div", { className: "font-mono space-y-0.5 text-slate-600" },
+      e("div", null, `θ ${spherical.theta.toFixed(0)}°`),
+      e("div", null, `φ ${spherical.phi.toFixed(0)}°`),
+      e("div", null, `r ${spherical.radius.toFixed(1)}`),
+      e("div", null, `focal ${focalLengthMm}mm`),
+      e("div", { className: "pt-1 mt-1 border-t border-slate-200 text-slate-500" },
+        presetName ?? "custom"
+      )
+    )
+  );
+}
+
+function PresetButtons() {
+  const applyPreset = useCameraStore((s) => s.applyPreset);
+  const currentPreset = useCameraStore((s) => s.presetName);
+
+  return e("div", {
+    className: "absolute top-3 right-3 bg-white/95 backdrop-blur rounded-lg p-2.5 shadow-lg border border-slate-200"
+  },
+    e("div", { className: "text-xs font-semibold mb-1.5 text-slate-700" }, "アングル"),
+    e("div", { className: "grid grid-cols-2 gap-1" },
+      ...CAMERA_PRESETS.map((preset) =>
+        e("button", {
+          key: preset.name,
+          type: "button",
+          onClick: () => applyPreset(preset),
+          className: `text-xs px-2 py-1 rounded transition-colors ${
+            currentPreset === preset.name
+              ? "bg-blue-600 text-white"
+              : "bg-slate-100 hover:bg-slate-200 text-slate-700"
+          }`,
+        }, preset.label)
+      )
+    )
+  );
+}
+
+function PartSelector() {
+  const selectedPart = usePoseStore((s) => s.selectedPart);
+  const setSelectedPart = usePoseStore((s) => s.setSelectedPart);
+
+  const renderButton = (part) =>
+    e("button", {
+      key: part,
+      type: "button",
+      onClick: () => setSelectedPart(part),
+      className: `text-xs px-2.5 py-1 rounded transition-colors ${
+        selectedPart === part
+          ? "bg-red-500 text-white"
+          : "bg-slate-100 hover:bg-slate-200 text-slate-700"
+      }`,
+    }, PART_LABELS[part]);
+
+  return e("div", {
+    className: "absolute bottom-3 left-1/2 -translate-x-1/2 bg-white/95 backdrop-blur rounded-lg p-2.5 shadow-lg border border-slate-200"
+  },
+    e("div", { className: "text-xs font-semibold mb-1.5 text-slate-700 text-center" }, "部位"),
+    e("div", { className: "flex flex-col gap-1.5" },
+      e("div", { className: "flex gap-1 justify-center" },
+        ...COMPOSITE_PARTS.map(renderButton)
+      ),
+      e("div", { className: "flex gap-1 justify-center flex-wrap max-w-xs" },
+        ...SINGLE_PARTS.map(renderButton)
+      )
+    )
+  );
+}
+
+function HelpHint() {
+  return e("div", {
+    className: "absolute bottom-3 right-3 bg-white/95 backdrop-blur rounded-lg p-2.5 shadow-lg text-xs border border-slate-200 max-w-[140px]"
+  },
+    e("div", { className: "font-semibold mb-1 text-slate-700" }, "操作"),
+    e("ul", { className: "space-y-0.5 text-slate-600" },
+      e("li", null, "ドラッグ: 回転"),
+      e("li", null, "ホイール/ピンチ: ズーム")
+    )
+  );
+}
+
+// ============================================================
+// Main App
+// ============================================================
+
+function App() {
+  return e("div", { className: "w-full h-screen bg-slate-50 relative overflow-hidden" },
+    e(DragHandler, null,
+      e(Canvas, {
+        camera: { position: [0, 4, 12], fov: 50 },
+        dpr: [1, 2],
+        gl: { antialias: true },
+      },
+        e(CameraController, null),
+        e(Mannequin, null)
+      )
+    ),
+    e(CameraInfo, null),
+    e(PresetButtons, null),
+    e(PartSelector, null),
+    e(HelpHint, null)
+  );
+}
+
+const root = createRoot(document.getElementById("root"));
+root.render(e(App, null));
+</script>
+</body>
+</html>
