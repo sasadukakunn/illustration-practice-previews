@@ -17,6 +17,7 @@
     "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
     "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
     "three": "https://esm.sh/three@0.166.0",
+    "three/addons/": "https://esm.sh/three@0.166.0/examples/jsm/",
     "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.17.10?external=react,react-dom,three",
     "zustand": "https://esm.sh/zustand@4.5.5?external=react"
   }
@@ -27,12 +28,30 @@
 <div id="root"></div>
 
 <script type="module">
-import React, { useEffect, useRef, useCallback } from "react";
+import React, { useEffect, useRef, useCallback, useState, Suspense } from "react";
 import { createRoot } from "react-dom/client";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { create } from "zustand";
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 const e = React.createElement;
+
+// ============================================================
+// VRM モデルの URL 設定(ここを変えれば差し替え可能)
+// ============================================================
+//
+// デフォルト: Avatar_Orion.vrm (CC0、確実に動作)
+// AvatarSample_A/B/C を使いたい場合:
+//   1. https://hub.vroid.com/ で各キャラのページにアクセス
+//   2. VRM ファイルをダウンロード(ログイン必要)
+//   3. 自分の GitHub リポジトリにアップロード
+//   4. 以下の URL をそのファイルへの raw URL に変更
+//
+// URL の構造例:
+//   https://raw.githubusercontent.com/<your-name>/<repo>/main/avatar.vrm
+
+const VRM_URL = "https://raw.githubusercontent.com/madjin/vrm-samples/master/Avatar_Orion.vrm";
 
 // ============================================================
 // lib/coordinates
@@ -40,8 +59,8 @@ const e = React.createElement;
 
 const PHI_MIN = 0.1;
 const PHI_MAX = 179.9;
-const RADIUS_MIN = 2;
-const RADIUS_MAX = 50;
+const RADIUS_MIN = 0.8;
+const RADIUS_MAX = 20;
 
 function sphericalToCartesian(sph, target) {
   const phiRad = (sph.phi * Math.PI) / 180;
@@ -79,19 +98,52 @@ function isPartSelected(selected, part) {
   return false;
 }
 
+// VRM 標準ボーン名 → 部位 のマッピング
+// VRM 0.x/1.0、Mixamo、Bone命名規則の揺れに対応
+const PART_BONE_KEYWORDS = {
+  head: ["head", "neck"],
+  torso: ["hips", "spine", "chest", "pelvis", "upperchest"],
+  arm_right: ["rightshoulder", "rightupperarm", "rightlowerarm", "rightforearm", "righthand", "rightarm"],
+  arm_left: ["leftshoulder", "leftupperarm", "leftlowerarm", "leftforearm", "lefthand", "leftarm"],
+  leg_right: ["rightupperleg", "rightlowerleg", "rightleg", "rightfoot", "rightthigh", "rightshin"],
+  leg_left: ["leftupperleg", "leftlowerleg", "leftleg", "leftfoot", "leftthigh", "leftshin"],
+};
+
+function getBonePart(boneName) {
+  const lower = boneName.toLowerCase();
+  // 指、目などは除外
+  if (lower.includes("eye") || lower.includes("jaw") || lower.includes("toe")) {
+    if (lower.includes("right") && lower.includes("toe")) return "leg_right";
+    if (lower.includes("left") && lower.includes("toe")) return "leg_left";
+    return null;
+  }
+  if (lower.includes("thumb") || lower.includes("index") || lower.includes("middle") || 
+      lower.includes("ring") || lower.includes("little") || lower.includes("pinky")) {
+    if (lower.includes("right")) return "arm_right";
+    if (lower.includes("left")) return "arm_left";
+    return null;
+  }
+  for (const [part, keywords] of Object.entries(PART_BONE_KEYWORDS)) {
+    for (const kw of keywords) {
+      if (lower.includes(kw)) return part;
+    }
+  }
+  return null;
+}
+
 // ============================================================
-// lib/cameraPresets
+// lib/cameraPresets(VRM用に距離を調整)
 // ============================================================
 
 const CAMERA_PRESETS = [
-  { name: "front", label: "正面", spherical: { theta: 0, phi: 90, radius: 12 }, focalLengthMm: 50 },
-  { name: "three_quarter_front", label: "斜め前", spherical: { theta: 45, phi: 90, radius: 12 }, focalLengthMm: 50 },
-  { name: "side_right", label: "右側面", spherical: { theta: 90, phi: 90, radius: 12 }, focalLengthMm: 50 },
-  { name: "back", label: "背面", spherical: { theta: 180, phi: 90, radius: 12 }, focalLengthMm: 50 },
-  { name: "side_left", label: "左側面", spherical: { theta: 270, phi: 90, radius: 12 }, focalLengthMm: 50 },
-  { name: "low_angle", label: "アオリ", spherical: { theta: 30, phi: 120, radius: 10 }, focalLengthMm: 35 },
-  { name: "high_angle", label: "フカン", spherical: { theta: 30, phi: 60, radius: 10 }, focalLengthMm: 35 },
-  { name: "top_down", label: "真俯瞰", spherical: { theta: 0, phi: 5, radius: 15 }, focalLengthMm: 50 },
+  { name: "front", label: "正面", spherical: { theta: 0, phi: 90, radius: 3.5 }, focalLengthMm: 50 },
+  { name: "three_quarter_front", label: "斜め前", spherical: { theta: 45, phi: 90, radius: 3.5 }, focalLengthMm: 50 },
+  { name: "side_right", label: "右側面", spherical: { theta: 90, phi: 90, radius: 3.5 }, focalLengthMm: 50 },
+  { name: "back", label: "背面", spherical: { theta: 180, phi: 90, radius: 3.5 }, focalLengthMm: 50 },
+  { name: "side_left", label: "左側面", spherical: { theta: 270, phi: 90, radius: 3.5 }, focalLengthMm: 50 },
+  { name: "low_angle", label: "アオリ", spherical: { theta: 30, phi: 120, radius: 3.0 }, focalLengthMm: 35 },
+  { name: "high_angle", label: "フカン", spherical: { theta: 30, phi: 60, radius: 3.0 }, focalLengthMm: 35 },
+  { name: "top_down", label: "真俯瞰", spherical: { theta: 0, phi: 5, radius: 4.0 }, focalLengthMm: 50 },
 ];
 
 // ============================================================
@@ -99,8 +151,8 @@ const CAMERA_PRESETS = [
 // ============================================================
 
 const INITIAL_CAMERA = {
-  spherical: { theta: 0, phi: 90, radius: 12 },
-  target: { x: 0, y: 3.2, z: 0 },
+  spherical: { theta: 0, phi: 90, radius: 3.5 },
+  target: { x: 0, y: 1.0, z: 0 },  // VRMの中心は約1m
   focalLengthMm: 50,
   presetName: "front",
 };
@@ -128,235 +180,156 @@ const usePoseStore = create((set) => ({
   setSelectedPart: (part) => set({ selectedPart: part }),
 }));
 
+// ロード状態
+const useLoadStore = create((set) => ({
+  status: "loading", // loading | ready | error
+  progress: 0,
+  error: null,
+  setProgress: (p) => set({ progress: p }),
+  setReady: () => set({ status: "ready" }),
+  setError: (err) => set({ status: "error", error: err }),
+}));
+
 // ============================================================
-// Mannequin v2 — アニメフィギュア風
+// VRM Mannequin コンポーネント
 // ============================================================
 
-const SELECTED_COLOR = "#ef4444";
-const SKIN_COLOR = "#e8d4c0";
-const JOINT_COLOR = "#d4b896";
+const SELECTED_TINT = new THREE.Color(1.0, 0.35, 0.35);
+const DEFAULT_TINT = new THREE.Color(1.0, 1.0, 1.0);
 
-// 関節位置(A-pose、6.5頭身)
-// y=0 が地面、y=6.5 が頭頂
-const JOINTS = {
-  pelvis:    { x: 0,    y: 3.2, z: 0 },
-  spine:     { x: 0,    y: 3.9, z: 0 },
-  chest:     { x: 0,    y: 4.7, z: 0 },
-  neck:      { x: 0,    y: 5.5, z: 0 },
-  head:      { x: 0,    y: 6.0, z: 0 },
-  shoulder_R:{ x: -0.85, y: 5.3, z: 0 },
-  elbow_R:   { x: -1.35, y: 4.2, z: 0 },
-  wrist_R:   { x: -1.65, y: 3.1, z: 0 },
-  hand_R:    { x: -1.78, y: 2.7, z: 0 },
-  shoulder_L:{ x: 0.85,  y: 5.3, z: 0 },
-  elbow_L:   { x: 1.35,  y: 4.2, z: 0 },
-  wrist_L:   { x: 1.65,  y: 3.1, z: 0 },
-  hand_L:    { x: 1.78,  y: 2.7, z: 0 },
-  hip_R:     { x: -0.4,  y: 3.0, z: 0 },
-  knee_R:    { x: -0.4,  y: 1.6, z: 0 },
-  ankle_R:   { x: -0.4,  y: 0.15, z: 0 },
-  hip_L:     { x: 0.4,   y: 3.0, z: 0 },
-  knee_L:    { x: 0.4,   y: 1.6, z: 0 },
-  ankle_L:   { x: 0.4,   y: 0.15, z: 0 },
-};
-
-// テーパー円柱(2点間をつなぐ)
-function TaperedBone({ from, to, radiusFrom, radiusTo, color }) {
-  const dx = to.x - from.x;
-  const dy = to.y - from.y;
-  const dz = to.z - from.z;
-  const length = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  const midX = (from.x + to.x) / 2;
-  const midY = (from.y + to.y) / 2;
-  const midZ = (from.z + to.z) / 2;
-
-  const dirX = dx / length;
-  const dirY = dy / length;
-  const dirZ = dz / length;
-
-  // (0,1,0) × (dirX, dirY, dirZ) で回転軸
-  const axisX = 1 * dirZ - 0 * dirY;
-  const axisZ = 0 * dirY - 1 * dirX;
-  const axisLen = Math.sqrt(axisX * axisX + axisZ * axisZ);
-
-  const dot = dirY;
-  const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
-
-  let nAxisX, nAxisY, nAxisZ;
-  if (axisLen < 0.0001) {
-    nAxisX = dot > 0 ? 0 : 1;
-    nAxisY = 0;
-    nAxisZ = 0;
-  } else {
-    nAxisX = axisX / axisLen;
-    nAxisY = 0;
-    nAxisZ = axisZ / axisLen;
-  }
-
-  return e("mesh", {
-    position: [midX, midY, midZ],
-    quaternion: [
-      nAxisX * Math.sin(angle / 2),
-      nAxisY * Math.sin(angle / 2),
-      nAxisZ * Math.sin(angle / 2),
-      Math.cos(angle / 2),
-    ],
-  },
-    e("cylinderGeometry", { args: [radiusTo, radiusFrom, length, 16] }),
-    e("meshStandardMaterial", { color, roughness: 0.7, metalness: 0.0 })
-  );
-}
-
-function Joint({ at, radius, color }) {
-  return e("mesh", { position: [at.x, at.y, at.z] },
-    e("sphereGeometry", { args: [radius, 16, 16] }),
-    e("meshStandardMaterial", { color, roughness: 0.7 })
-  );
-}
-
-function Mannequin() {
+function VRMMannequin() {
+  const groupRef = useRef();
+  const [gltf, setGltf] = useState(null);
+  const skinnedMeshesRef = useRef([]);
   const selectedPart = usePoseStore((s) => s.selectedPart);
-  const J = JOINTS;
-  
-  const headColor = isPartSelected(selectedPart, "head") ? SELECTED_COLOR : SKIN_COLOR;
-  const torsoColor = isPartSelected(selectedPart, "torso") ? SELECTED_COLOR : SKIN_COLOR;
-  const armRColor = isPartSelected(selectedPart, "arm_right") ? SELECTED_COLOR : SKIN_COLOR;
-  const armLColor = isPartSelected(selectedPart, "arm_left") ? SELECTED_COLOR : SKIN_COLOR;
-  const legRColor = isPartSelected(selectedPart, "leg_right") ? SELECTED_COLOR : SKIN_COLOR;
-  const legLColor = isPartSelected(selectedPart, "leg_left") ? SELECTED_COLOR : SKIN_COLOR;
-  
-  const jointColor = (basePart) =>
-    isPartSelected(selectedPart, basePart) ? SELECTED_COLOR : JOINT_COLOR;
+  const setProgress = useLoadStore((s) => s.setProgress);
+  const setReady = useLoadStore((s) => s.setReady);
+  const setError = useLoadStore((s) => s.setError);
 
+  // VRM ロード(一度だけ)
+  useEffect(() => {
+    const loader = new GLTFLoader();
+    loader.load(
+      VRM_URL,
+      (loaded) => {
+        // SkinnedMesh を集める & 頂点カラー属性を準備
+        const skins = [];
+        loaded.scene.traverse((obj) => {
+          if (obj.isSkinnedMesh) {
+            // 頂点カラー初期化(全部白)
+            const vertCount = obj.geometry.attributes.position.count;
+            const colors = new Float32Array(vertCount * 3);
+            for (let i = 0; i < vertCount; i++) {
+              colors[i * 3] = 1.0;
+              colors[i * 3 + 1] = 1.0;
+              colors[i * 3 + 2] = 1.0;
+            }
+            obj.geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+
+            // マテリアルを vertexColors 有効に
+            const applyVC = (mat) => {
+              if (mat) {
+                mat.vertexColors = true;
+                mat.needsUpdate = true;
+              }
+            };
+            if (Array.isArray(obj.material)) {
+              obj.material.forEach(applyVC);
+            } else {
+              applyVC(obj.material);
+            }
+
+            // 各頂点について最も影響強いボーンを判定して記録
+            const skinIndex = obj.geometry.attributes.skinIndex;
+            const skinWeight = obj.geometry.attributes.skinWeight;
+            const vertexParts = new Array(vertCount).fill(null);
+            
+            for (let v = 0; v < vertCount; v++) {
+              let maxWeight = 0;
+              let maxBoneIdx = 0;
+              for (let i = 0; i < 4; i++) {
+                const w = skinWeight.getComponent(v, i);
+                if (w > maxWeight) {
+                  maxWeight = w;
+                  maxBoneIdx = skinIndex.getComponent(v, i);
+                }
+              }
+              const bone = obj.skeleton.bones[maxBoneIdx];
+              if (bone) {
+                vertexParts[v] = getBonePart(bone.name);
+              }
+            }
+            
+            skins.push({ mesh: obj, vertexParts, colors });
+          }
+        });
+        skinnedMeshesRef.current = skins;
+        
+        // VRM 0.x は前方が -Z なので 180度回転(顔をカメラ側に)
+        loaded.scene.rotation.y = Math.PI;
+        
+        setGltf(loaded);
+        setReady();
+      },
+      (xhr) => {
+        if (xhr.lengthComputable) {
+          setProgress(Math.round((xhr.loaded / xhr.total) * 100));
+        }
+      },
+      (err) => {
+        console.error("VRM load error:", err);
+        setError(err?.message ?? "Load failed");
+      }
+    );
+  }, []);
+
+  // 部位選択変更時、頂点カラーを更新
+  useEffect(() => {
+    if (!gltf) return;
+    const skins = skinnedMeshesRef.current;
+    for (const { mesh, vertexParts, colors } of skins) {
+      for (let v = 0; v < vertexParts.length; v++) {
+        const part = vertexParts[v];
+        const highlight = part && isPartSelected(selectedPart, part);
+        if (highlight) {
+          colors[v * 3] = SELECTED_TINT.r;
+          colors[v * 3 + 1] = SELECTED_TINT.g;
+          colors[v * 3 + 2] = SELECTED_TINT.b;
+        } else {
+          colors[v * 3] = DEFAULT_TINT.r;
+          colors[v * 3 + 1] = DEFAULT_TINT.g;
+          colors[v * 3 + 2] = DEFAULT_TINT.b;
+        }
+      }
+      mesh.geometry.attributes.color.needsUpdate = true;
+    }
+  }, [selectedPart, gltf]);
+
+  if (!gltf) return null;
+  return e("primitive", { object: gltf.scene, ref: groupRef });
+}
+
+// 床+ライティング(マネキンと分離)
+function Stage() {
   return e("group", null,
-    // 3点照明
-    e("ambientLight", { intensity: 0.5 }),
-    e("directionalLight", { position: [5, 10, 5], intensity: 0.7 }),
-    e("directionalLight", { position: [-5, 5, -5], intensity: 0.3 }),
-    e("directionalLight", { position: [0, 5, -8], intensity: 0.2 }),
+    e("ambientLight", { intensity: 0.6 }),
+    e("directionalLight", { position: [3, 5, 3], intensity: 0.8 }),
+    e("directionalLight", { position: [-3, 3, -3], intensity: 0.3 }),
+    e("directionalLight", { position: [0, 3, -5], intensity: 0.2 }),
 
-    // 床(円形 + 同心円リング)
+    // 円形の床
     e("mesh", { rotation: [-Math.PI / 2, 0, 0], position: [0, 0, 0] },
-      e("circleGeometry", { args: [8, 64] }),
+      e("circleGeometry", { args: [3, 64] }),
       e("meshStandardMaterial", { color: "#e2e8f0", roughness: 0.9 })
     ),
-    e("mesh", { rotation: [-Math.PI / 2, 0, 0], position: [0, 0.01, 0] },
-      e("ringGeometry", { args: [3, 3.05, 64] }),
+    // 同心円リング
+    e("mesh", { rotation: [-Math.PI / 2, 0, 0], position: [0, 0.005, 0] },
+      e("ringGeometry", { args: [1, 1.015, 64] }),
       e("meshStandardMaterial", { color: "#cbd5e1" })
     ),
-    e("mesh", { rotation: [-Math.PI / 2, 0, 0], position: [0, 0.01, 0] },
-      e("ringGeometry", { args: [5, 5.04, 64] }),
+    e("mesh", { rotation: [-Math.PI / 2, 0, 0], position: [0, 0.005, 0] },
+      e("ringGeometry", { args: [2, 2.015, 64] }),
       e("meshStandardMaterial", { color: "#cbd5e1" })
-    ),
-    e("mesh", { rotation: [-Math.PI / 2, 0, 0], position: [0, 0.01, 0] },
-      e("ringGeometry", { args: [7, 7.03, 64] }),
-      e("meshStandardMaterial", { color: "#cbd5e1" })
-    ),
-
-    // === 頭(楕円球で卵型)===
-    e("mesh", { position: [J.head.x, J.head.y, J.head.z], scale: [0.85, 1.0, 0.85] },
-      e("sphereGeometry", { args: [0.55, 32, 32] }),
-      e("meshStandardMaterial", { color: headColor, roughness: 0.6 })
-    ),
-
-    // === 首 ===
-    e(TaperedBone, {
-      from: J.neck, to: { x: J.head.x, y: J.head.y - 0.45, z: J.head.z },
-      radiusFrom: 0.2, radiusTo: 0.22, color: torsoColor,
-    }),
-
-    // === 胴体 ===
-    // 胸郭(扁平な球で表現)
-    e("mesh", { position: [0, (J.chest.y + J.shoulder_R.y) / 2, 0], scale: [1.6, 0.9, 0.85] },
-      e("sphereGeometry", { args: [0.55, 24, 24] }),
-      e("meshStandardMaterial", { color: torsoColor, roughness: 0.7 })
-    ),
-    // 胸→ウエスト(細くなる)
-    e(TaperedBone, {
-      from: { x: 0, y: J.chest.y - 0.2, z: 0 },
-      to: { x: 0, y: J.spine.y, z: 0 },
-      radiusFrom: 0.7, radiusTo: 0.55, color: torsoColor,
-    }),
-    // ウエスト→腰(また広がる)
-    e(TaperedBone, {
-      from: { x: 0, y: J.spine.y, z: 0 },
-      to: J.pelvis,
-      radiusFrom: 0.55, radiusTo: 0.7, color: torsoColor,
-    }),
-    // 腰(扁平な球)
-    e("mesh", { position: [J.pelvis.x, J.pelvis.y - 0.15, J.pelvis.z], scale: [1.4, 0.8, 0.9] },
-      e("sphereGeometry", { args: [0.5, 24, 24] }),
-      e("meshStandardMaterial", { color: torsoColor, roughness: 0.7 })
-    ),
-
-    // === 右腕 ===
-    e(Joint, { at: J.shoulder_R, radius: 0.28, color: jointColor("arm_right") }),
-    e(TaperedBone, {
-      from: J.shoulder_R, to: J.elbow_R,
-      radiusFrom: 0.24, radiusTo: 0.19, color: armRColor,
-    }),
-    e(Joint, { at: J.elbow_R, radius: 0.21, color: jointColor("arm_right") }),
-    e(TaperedBone, {
-      from: J.elbow_R, to: J.wrist_R,
-      radiusFrom: 0.19, radiusTo: 0.15, color: armRColor,
-    }),
-    e(Joint, { at: J.wrist_R, radius: 0.16, color: jointColor("arm_right") }),
-    // 手(扁平な楕円球)
-    e("mesh", { position: [J.hand_R.x, J.hand_R.y, J.hand_R.z], scale: [0.7, 1.0, 0.5] },
-      e("sphereGeometry", { args: [0.22, 16, 16] }),
-      e("meshStandardMaterial", { color: armRColor, roughness: 0.7 })
-    ),
-
-    // === 左腕 ===
-    e(Joint, { at: J.shoulder_L, radius: 0.28, color: jointColor("arm_left") }),
-    e(TaperedBone, {
-      from: J.shoulder_L, to: J.elbow_L,
-      radiusFrom: 0.24, radiusTo: 0.19, color: armLColor,
-    }),
-    e(Joint, { at: J.elbow_L, radius: 0.21, color: jointColor("arm_left") }),
-    e(TaperedBone, {
-      from: J.elbow_L, to: J.wrist_L,
-      radiusFrom: 0.19, radiusTo: 0.15, color: armLColor,
-    }),
-    e(Joint, { at: J.wrist_L, radius: 0.16, color: jointColor("arm_left") }),
-    e("mesh", { position: [J.hand_L.x, J.hand_L.y, J.hand_L.z], scale: [0.7, 1.0, 0.5] },
-      e("sphereGeometry", { args: [0.22, 16, 16] }),
-      e("meshStandardMaterial", { color: armLColor, roughness: 0.7 })
-    ),
-
-    // === 右脚 ===
-    e(Joint, { at: J.hip_R, radius: 0.3, color: jointColor("leg_right") }),
-    e(TaperedBone, {
-      from: J.hip_R, to: J.knee_R,
-      radiusFrom: 0.28, radiusTo: 0.22, color: legRColor,
-    }),
-    e(Joint, { at: J.knee_R, radius: 0.24, color: jointColor("leg_right") }),
-    e(TaperedBone, {
-      from: J.knee_R, to: J.ankle_R,
-      radiusFrom: 0.22, radiusTo: 0.17, color: legRColor,
-    }),
-    e(Joint, { at: J.ankle_R, radius: 0.18, color: jointColor("leg_right") }),
-    // 足(つま先方向に伸びる楕円球)
-    e("mesh", { position: [J.ankle_R.x, J.ankle_R.y - 0.05, J.ankle_R.z + 0.2], scale: [0.6, 0.5, 1.2] },
-      e("sphereGeometry", { args: [0.25, 16, 16] }),
-      e("meshStandardMaterial", { color: legRColor, roughness: 0.7 })
-    ),
-
-    // === 左脚 ===
-    e(Joint, { at: J.hip_L, radius: 0.3, color: jointColor("leg_left") }),
-    e(TaperedBone, {
-      from: J.hip_L, to: J.knee_L,
-      radiusFrom: 0.28, radiusTo: 0.22, color: legLColor,
-    }),
-    e(Joint, { at: J.knee_L, radius: 0.24, color: jointColor("leg_left") }),
-    e(TaperedBone, {
-      from: J.knee_L, to: J.ankle_L,
-      radiusFrom: 0.22, radiusTo: 0.17, color: legLColor,
-    }),
-    e(Joint, { at: J.ankle_L, radius: 0.18, color: jointColor("leg_left") }),
-    e("mesh", { position: [J.ankle_L.x, J.ankle_L.y - 0.05, J.ankle_L.z + 0.2], scale: [0.6, 0.5, 1.2] },
-      e("sphereGeometry", { args: [0.25, 16, 16] }),
-      e("meshStandardMaterial", { color: legLColor, roughness: 0.7 })
     )
   );
 }
@@ -393,7 +366,7 @@ function CameraController() {
 // ============================================================
 
 const ROTATION_SPEED = 0.4;
-const ZOOM_SPEED = 0.02;
+const ZOOM_SPEED = 0.005;
 
 function DragHandler({ children }) {
   const setAngle = useCameraStore((s) => s.setAngle);
@@ -467,7 +440,7 @@ function DragHandler({ children }) {
 }
 
 // ============================================================
-// UI Components(変更なし)
+// UI
 // ============================================================
 
 function CameraInfo() {
@@ -482,7 +455,7 @@ function CameraInfo() {
     e("div", { className: "font-mono space-y-0.5 text-slate-600" },
       e("div", null, `θ ${spherical.theta.toFixed(0)}°`),
       e("div", null, `φ ${spherical.phi.toFixed(0)}°`),
-      e("div", null, `r ${spherical.radius.toFixed(1)}`),
+      e("div", null, `r ${spherical.radius.toFixed(2)}`),
       e("div", null, `focal ${focalLengthMm}mm`),
       e("div", { className: "pt-1 mt-1 border-t border-slate-200 text-slate-500" },
         presetName ?? "custom"
@@ -554,7 +527,40 @@ function HelpHint() {
     e("div", { className: "font-semibold mb-1 text-slate-700" }, "操作"),
     e("ul", { className: "space-y-0.5 text-slate-600" },
       e("li", null, "ドラッグ: 回転"),
-      e("li", null, "ホイール/ピンチ: ズーム")
+      e("li", null, "ピンチ: ズーム")
+    )
+  );
+}
+
+// ロードオーバーレイ
+function LoadingOverlay() {
+  const status = useLoadStore((s) => s.status);
+  const progress = useLoadStore((s) => s.progress);
+  const error = useLoadStore((s) => s.error);
+  
+  if (status === "ready") return null;
+  
+  return e("div", {
+    className: "absolute inset-0 bg-slate-100/90 backdrop-blur flex items-center justify-center pointer-events-none z-50"
+  },
+    e("div", { className: "bg-white rounded-lg p-6 shadow-lg max-w-sm text-center" },
+      status === "loading" && e("div", null,
+        e("div", { className: "text-sm font-semibold mb-3 text-slate-700" }, "3Dモデルを読み込み中..."),
+        e("div", { className: "w-48 h-2 bg-slate-200 rounded-full overflow-hidden mx-auto" },
+          e("div", {
+            className: "h-full bg-blue-500 transition-all duration-200",
+            style: { width: `${progress}%` }
+          })
+        ),
+        e("div", { className: "text-xs text-slate-500 mt-2" }, `${progress}%`)
+      ),
+      status === "error" && e("div", null,
+        e("div", { className: "text-sm font-semibold text-red-600 mb-2" }, "読み込み失敗"),
+        e("div", { className: "text-xs text-slate-600 break-all" }, error ?? "Unknown error"),
+        e("div", { className: "text-xs text-slate-500 mt-3" },
+          "VRM_URL の値を確認してください"
+        )
+      )
     )
   );
 }
@@ -567,18 +573,20 @@ function App() {
   return e("div", { className: "w-full h-screen bg-gradient-to-b from-slate-100 to-slate-200 relative overflow-hidden" },
     e(DragHandler, null,
       e(Canvas, {
-        camera: { position: [0, 4, 12], fov: 50 },
+        camera: { position: [0, 1, 3.5], fov: 50 },
         dpr: [1, 2],
         gl: { antialias: true },
       },
         e(CameraController, null),
-        e(Mannequin, null)
+        e(Stage, null),
+        e(VRMMannequin, null)
       )
     ),
     e(CameraInfo, null),
     e(PresetButtons, null),
     e(PartSelector, null),
-    e(HelpHint, null)
+    e(HelpHint, null),
+    e(LoadingOverlay, null)
   );
 }
 
